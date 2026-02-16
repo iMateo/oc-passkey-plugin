@@ -1,0 +1,6 @@
+"1.0.0":
+    - "Initial version of Passkey plugin"
+    - create_credentials_table.php
+"1.0.1":
+    - "Security: add index on credential_id for login performance"
+    - add_credential_id_index.php

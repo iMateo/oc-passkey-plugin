@@ -1,0 +1,27 @@
+{
+    "name": "ihorchyshkala/passkey-plugin",
+    "type": "october-plugin",
+    "description": "WebAuthn/Passkey authentication for October CMS backend",
+    "keywords": ["october", "octobercms", "passkey", "webauthn", "fido2", "authentication", "security"],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Ihor Chyshkala",
+            "homepage": "https://chyshkala.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.0.2",
+        "composer/installers": "~1.0",
+        "october/rain": ">=3.1 <4.0",
+        "lbuchs/webauthn": "^2.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "IHORCHYSHKALA\\Passkey\\": ""
+        }
+    },
+    "extra": {
+        "installer-name": "ihorchyshkala/passkey"
+    }
+}
