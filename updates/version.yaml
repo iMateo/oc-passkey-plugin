@@ -1,4 +1,14 @@
-"2.0.0":
-    - "Initial version for OctoberCMS v4 (Laravel 12)"
+"1.0.0":
+    - "Initial version of Passkey plugin"
     - create_credentials_table.php
+"1.0.1":
+    - "Security: add index on credential_id for login performance"
     - add_credential_id_index.php
+"1.0.2":
+    - "Security: own-account passkey registration with password re-authentication; unique credential_id; login honours throttle/ban"
+    - add_credential_id_unique_index.php
+"2.0.0":
+    - "Single release line for October CMS 3.1+ and 4.x"
+"2.0.1":
+    - "Security: own-account passkey registration with password re-authentication, unique credential_id, throttle/ban on passkey login, generic error messages"
+    - add_credential_id_unique_index.php

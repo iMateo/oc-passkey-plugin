@@ -30,6 +30,31 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
+    /**
+     * Extract a server error message from a $.request error callback argument.
+     * October v4 (Larajax): decorated object, message in data.$env.getMessage().
+     * October v3: plain-text message body, or an object with X_OCTOBER_ERROR_MESSAGE (406).
+     */
+    function extractErrorMessage(data, fallback) {
+        try {
+            if (data && data.$env && typeof data.$env.getMessage === 'function' && data.$env.getMessage()) {
+                return String(data.$env.getMessage());
+            }
+            if (data && typeof data === 'object') {
+                if (data.X_OCTOBER_ERROR_MESSAGE) return String(data.X_OCTOBER_ERROR_MESSAGE);
+                if (typeof data.message === 'string' && data.message) return data.message;
+                if (typeof data.responseText === 'string') {
+                    return extractErrorMessage(JSON.parse(data.responseText), fallback);
+                }
+            }
+            if (typeof data === 'string') {
+                var text = data.trim();
+                if (text && text.length < 500 && text.charAt(0) !== '<') return text;
+            }
+        } catch (e) {}
+        return fallback;
+    }
+
     function setLoading(loading) {
         btn.disabled = loading;
         btn.classList.toggle('passkey-btn-loading', loading);
@@ -42,16 +67,16 @@ document.addEventListener('DOMContentLoaded', function () {
         // Step 1: Get assertion options from server
         $.request('onPasskeyLoginOptions', {
             success: function (data) {
+                if (!data || !data.options || !data.options.publicKey) {
+                    setLoading(false);
+                    showError('Failed to start passkey authentication.');
+                    return;
+                }
                 handleLoginOptions(data.options);
             },
-            error: function (xhr) {
+            error: function (data) {
                 setLoading(false);
-                var msg = 'Failed to start passkey authentication.';
-                try {
-                    var resp = JSON.parse(xhr.responseText);
-                    if (resp.X_OCTOBER_ERROR_MESSAGE) msg = resp.X_OCTOBER_ERROR_MESSAGE;
-                } catch (e) {}
-                showError(msg);
+                showError(extractErrorMessage(data, 'Failed to start passkey authentication.'));
             }
         });
     }
@@ -105,14 +130,9 @@ document.addEventListener('DOMContentLoaded', function () {
                     window.location.reload();
                 }
             },
-            error: function (xhr) {
+            error: function (data) {
                 setLoading(false);
-                var msg = 'Passkey verification failed.';
-                try {
-                    var resp = JSON.parse(xhr.responseText);
-                    if (resp.X_OCTOBER_ERROR_MESSAGE) msg = resp.X_OCTOBER_ERROR_MESSAGE;
-                } catch (e) {}
-                showError(msg);
+                showError(extractErrorMessage(data, 'Passkey verification failed.'));
             }
         });
     }

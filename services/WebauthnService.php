@@ -3,6 +3,7 @@
 namespace IHORCHYSHKALA\Passkey\Services;
 
 use Backend;
+use Config;
 use Session;
 use Validator;
 use lbuchs\WebAuthn\WebAuthn;
@@ -10,12 +11,25 @@ use lbuchs\WebAuthn\Binary\ByteBuffer;
 use IHORCHYSHKALA\Passkey\Models\WebauthnCredential;
 use Backend\Models\User as BackendUser;
 
+/**
+ * WebAuthn ceremonies for backend users.
+ *
+ * Exception messages thrown from this class are meant for the server log only;
+ * callers must translate failures into generic messages for the client.
+ */
 class WebauthnService
 {
     /**
      * Maximum time (seconds) a challenge is valid after creation.
      */
     protected const CHALLENGE_TTL = 120;
+
+    /**
+     * Separate session slots so a login ceremony cannot consume (or be satisfied by)
+     * a registration challenge and vice versa.
+     */
+    protected const SESSION_KEY_REGISTER = 'ihorchyshkala_passkey_challenge_register';
+    protected const SESSION_KEY_LOGIN = 'ihorchyshkala_passkey_challenge_login';
 
     protected function getWebAuthn(): WebAuthn
     {
@@ -25,20 +39,50 @@ class WebauthnService
         return new WebAuthn($rpName, $rpId, ['none'], true);
     }
 
+    /**
+     * RP ID: pinned via plugin config (`rp_id`, env PASSKEY_RP_ID), otherwise the backend host.
+     */
     protected function getRpId(): string
     {
+        $pinned = Config::get('ihorchyshkala.passkey::rp_id');
+        if (is_string($pinned) && trim($pinned) !== '') {
+            return strtolower(trim($pinned));
+        }
+
         $backendUrl = Backend::url('/');
         $parsed = parse_url($backendUrl);
 
-        return $parsed['host'] ?? 'localhost';
+        return strtolower($parsed['host'] ?? 'localhost');
     }
 
     /**
-     * Decode base64url (RFC 4648) to binary string
+     * Strictly decode base64url (RFC 4648 §5, padding optional) to a binary string.
+     * Throws on any character outside the alphabet or an impossible length.
      */
     protected function base64urlDecode(string $data): string
     {
-        return base64_decode(strtr($data, '-_', '+/'));
+        if (!preg_match('/\A[A-Za-z0-9_-]+={0,2}\z/', $data)) {
+            throw new \ApplicationException('Invalid base64url data.');
+        }
+
+        $data = rtrim($data, '=');
+        $length = strlen($data);
+
+        if ($length === 0 || $length % 4 === 1) {
+            throw new \ApplicationException('Invalid base64url data.');
+        }
+
+        $base64 = strtr($data, '-_', '+/');
+        if ($length % 4 !== 0) {
+            $base64 .= str_repeat('=', 4 - $length % 4);
+        }
+
+        $decoded = base64_decode($base64, true);
+        if ($decoded === false) {
+            throw new \ApplicationException('Invalid base64url data.');
+        }
+
+        return $decoded;
     }
 
     /**
@@ -50,29 +94,46 @@ class WebauthnService
     }
 
     /**
+     * WebAuthn user handle assigned to a backend user at registration:
+     * the user id as big-endian bytes, at least 4 bytes long.
+     */
+    public function getUserHandle(int $userId): string
+    {
+        $hex = dechex($userId);
+        $length = max(8, strlen($hex) + (strlen($hex) % 2));
+
+        return hex2bin(str_pad($hex, $length, '0', STR_PAD_LEFT));
+    }
+
+    /**
      * Store the challenge in session with a timestamp
      */
-    protected function storeChallenge(WebAuthn $webAuthn): void
+    protected function storeChallenge(WebAuthn $webAuthn, string $sessionKey, ?int $userId = null): void
     {
-        Session::put('webauthn_challenge', [
+        Session::put($sessionKey, [
             'hex' => $webAuthn->getChallenge()->getHex(),
             'created_at' => time(),
+            'user_id' => $userId,
         ]);
     }
 
     /**
-     * Pull and validate the challenge from session (one-time use + TTL)
+     * Pull and validate the challenge from session (one-time use + TTL + user binding)
      */
-    protected function pullChallenge(): ByteBuffer
+    protected function pullChallenge(string $sessionKey, ?int $expectedUserId = null): ByteBuffer
     {
-        $data = Session::pull('webauthn_challenge');
+        $data = Session::pull($sessionKey);
 
-        if (!$data || empty($data['hex'])) {
-            throw new \ApplicationException('Session expired. Please try again.');
+        if (!is_array($data) || empty($data['hex'])) {
+            throw new \ApplicationException('Challenge missing from session.');
         }
 
         if ((time() - ($data['created_at'] ?? 0)) > static::CHALLENGE_TTL) {
-            throw new \ApplicationException('Challenge expired. Please try again.');
+            throw new \ApplicationException('Challenge expired.');
+        }
+
+        if ($expectedUserId !== null && (int) ($data['user_id'] ?? 0) !== $expectedUserId) {
+            throw new \ApplicationException('Challenge was issued for a different user.');
         }
 
         return ByteBuffer::fromHex($data['hex']);
@@ -94,7 +155,7 @@ class WebauthnService
             ->all();
 
         $createArgs = $webAuthn->getCreateArgs(
-            hex2bin(str_pad(dechex($user->id), 8, '0', STR_PAD_LEFT)),
+            $this->getUserHandle((int) $user->id),
             $user->login,
             $user->full_name,
             60,
@@ -104,7 +165,7 @@ class WebauthnService
             $existingCredentials
         );
 
-        $this->storeChallenge($webAuthn);
+        $this->storeChallenge($webAuthn, static::SESSION_KEY_REGISTER, (int) $user->id);
 
         return json_decode(json_encode($createArgs), true);
     }
@@ -114,9 +175,9 @@ class WebauthnService
      */
     public function verifyRegistration(
         BackendUser $user,
-        string $clientDataJSON,
-        string $attestationObject,
-        string $name = ''
+        ?string $clientDataJSON,
+        ?string $attestationObject,
+        ?string $name = ''
     ): WebauthnCredential {
         // Validate inputs
         $validation = Validator::make(
@@ -124,7 +185,7 @@ class WebauthnService
             [
                 'clientDataJSON' => 'required|string|min:10',
                 'attestationObject' => 'required|string|min:10',
-                'name' => 'string|max:100',
+                'name' => 'nullable|string|max:100',
             ]
         );
         if ($validation->fails()) {
@@ -132,7 +193,7 @@ class WebauthnService
         }
 
         $webAuthn = $this->getWebAuthn();
-        $challenge = $this->pullChallenge();
+        $challenge = $this->pullChallenge(static::SESSION_KEY_REGISTER, (int) $user->id);
 
         $data = $webAuthn->processCreate(
             $this->base64urlDecode($clientDataJSON),
@@ -143,11 +204,18 @@ class WebauthnService
             false   // failIfRootMismatch - we use attestation 'none'
         );
 
-        $safeName = mb_substr(trim($name) ?: 'Passkey', 0, 100);
+        $credentialId = $this->base64urlEncode($data->credentialId);
+
+        // A credential ID must belong to exactly one account
+        if (WebauthnCredential::where('credential_id', $credentialId)->exists()) {
+            throw new \ApplicationException('Credential ID is already registered.');
+        }
+
+        $safeName = mb_substr(trim((string) $name) ?: 'Passkey', 0, 100);
 
         $credential = new WebauthnCredential();
         $credential->backend_user_id = $user->id;
-        $credential->credential_id = $this->base64urlEncode($data->credentialId);
+        $credential->credential_id = $credentialId;
         $credential->public_key = $data->credentialPublicKey;
         $credential->name = $safeName;
         $credential->sign_count = $data->signatureCounter ?? 0;
@@ -174,7 +242,7 @@ class WebauthnService
             'required' // requireUserVerification
         );
 
-        $this->storeChallenge($webAuthn);
+        $this->storeChallenge($webAuthn, static::SESSION_KEY_LOGIN);
 
         return json_decode(json_encode($getArgs), true);
     }
@@ -196,12 +264,14 @@ class WebauthnService
                 'client_data_json' => $clientDataJSON,
                 'authenticator_data' => $authenticatorData,
                 'signature' => $signature,
+                'user_handle' => $userHandleBase64url,
             ],
             [
-                'credential_id' => 'required|string|min:10',
+                'credential_id' => 'required|string|min:10|max:512',
                 'client_data_json' => 'required|string|min:10',
                 'authenticator_data' => 'required|string|min:10',
                 'signature' => 'required|string|min:10',
+                'user_handle' => 'nullable|string|max:512',
             ]
         );
         if ($validation->fails()) {
@@ -209,14 +279,31 @@ class WebauthnService
         }
 
         $webAuthn = $this->getWebAuthn();
-        $challenge = $this->pullChallenge();
+        $challenge = $this->pullChallenge(static::SESSION_KEY_LOGIN);
 
-        // Find credential by credential ID (stored as base64url)
-        $credential = WebauthnCredential::where('credential_id', $credentialIdBase64url)->first();
+        // Reject non-canonical encodings so the lookup string is unambiguous
+        if ($this->base64urlEncode($this->base64urlDecode($credentialIdBase64url)) !== $credentialIdBase64url) {
+            throw new \ApplicationException('Non-canonical credential ID.');
+        }
+
+        // Find credential by credential ID (stored as base64url). Compare exactly in PHP,
+        // since the DB collation may be case-insensitive.
+        $credential = WebauthnCredential::where('credential_id', $credentialIdBase64url)
+            ->get()
+            ->first(function ($row) use ($credentialIdBase64url) {
+                return hash_equals((string) $row->credential_id, $credentialIdBase64url);
+            });
 
         if (!$credential) {
-            // Use generic message to avoid credential enumeration
-            throw new \ApplicationException('Passkey authentication failed.');
+            throw new \ApplicationException('Unknown credential ID.');
+        }
+
+        // If the authenticator returned a user handle it must match the one assigned at registration
+        if ($userHandleBase64url !== null && $userHandleBase64url !== '') {
+            $userHandle = $this->base64urlDecode($userHandleBase64url);
+            if (!hash_equals($this->getUserHandle((int) $credential->backend_user_id), $userHandle)) {
+                throw new \ApplicationException('User handle does not match credential owner.');
+            }
         }
 
         $webAuthn->processGet(
@@ -234,18 +321,16 @@ class WebauthnService
         $credential->sign_count = $webAuthn->getSignatureCounter() ?? $credential->sign_count;
         $credential->save();
 
-        // Return the associated backend user
+        // Return the associated backend user (soft-deleted users are excluded by find())
         $user = BackendUser::find($credential->backend_user_id);
 
         if (!$user || $user->trashed()) {
-            throw new \ApplicationException('User account not found or disabled.');
+            throw new \ApplicationException('Credential owner not found or deleted.');
         }
 
-        // Check user is activated (backend doesn't require this by default,
-        // but a deactivated admin should not be able to log in via passkey)
-        if (!$user->is_activated) {
-            throw new \ApplicationException('User account is deactivated.');
-        }
+        // Note: no is_activated check. Backend auth does not require activation
+        // (AuthManager::$requireActivation = false) and admins created through the
+        // Users form keep the column default (0), so such a check would lock them out.
 
         return $user;
     }
